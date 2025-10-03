@@ -4,6 +4,8 @@ from torch import nn
 
 from jdet.utils.registry import MODELS,build_from_cfg,BACKBONES,HEADS,NECKS
 
+from ._training import set_module_training_mode
+
 
 @MODELS.register_module()
 class RCNN(nn.Module):
