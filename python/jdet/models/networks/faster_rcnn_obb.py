@@ -5,6 +5,8 @@ from jdet.ops.bbox_transforms import bbox2roi, dbbox2result
 import jittor as jt
 from jdet.utils.general import parse_losses
 
+from ._training import set_module_training_mode
+
 @MODELS.register_module()
 class FasterRCNNOBB(nn.Module):
 
@@ -199,8 +201,14 @@ class FasterRCNNOBBNew(nn.Module):
             det_result = self.bbox_head(features, proposal_list, targets)
             return det_result
 
-    def train(self):
-        super(FasterRCNNOBBNew, self).train()
+    def train(self, mode: bool = True):
+        try:
+            super(FasterRCNNOBBNew, self).train(mode)
+        except TypeError:
+            super(FasterRCNNOBBNew, self).train()
+
         for v in self.__dict__.values():
             if isinstance(v, nn.Module):
-                v.train()
+                set_module_training_mode(v, mode)
+
+        return self
