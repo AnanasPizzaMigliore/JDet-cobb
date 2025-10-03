@@ -4,10 +4,12 @@ from jdet.utils.general import multi_apply
 
 from jdet.utils.registry import MODELS,build_from_cfg,BACKBONES,HEADS,NECKS
 from jdet.config.config import Config
-# from jdet.models.networks import RotatedRetinaNet  
+# from jdet.models.networks import RotatedRetinaNet
 from .rotated_retinanet import RotatedRetinaNet
 
 from pathlib import Path
+
+from ._training import set_module_training_mode
 
 @MODELS.register_module()
 class KnowledgeDistillationSingleStageDetector(RotatedRetinaNet):
@@ -44,10 +46,6 @@ class KnowledgeDistillationSingleStageDetector(RotatedRetinaNet):
             else:
                 self.teacher_model.load_parameters(resume_data)
 
-    def train(self):
-        super().train()
-        self.backbone.train()
-        
     def execute_train(self, images, targets):
         features = self.backbone(images)
         if self.neck:
@@ -70,13 +68,26 @@ class KnowledgeDistillationSingleStageDetector(RotatedRetinaNet):
             return self.execute_train(images, targets)
         return super().execute(images, targets)
     
-    def train(self):
-        super().train()
-        self.backbone.train()
+    def train(self, mode: bool = True):
+        try:
+            super().train(mode)
+        except TypeError:
+            super().train()
+
+        set_module_training_mode(self.backbone, mode)
+        if getattr(self, "neck", None):
+            set_module_training_mode(self.neck, mode)
+        if getattr(self, "bbox_head", None):
+            set_module_training_mode(self.bbox_head, mode)
+
         if self.eval_teacher:
-            self.teacher_model.eval()
+            eval_fn = getattr(self.teacher_model, "eval", None)
+            if callable(eval_fn):
+                eval_fn()
         else:
-            self.teacher_model.train()
+            set_module_training_mode(self.teacher_model, mode)
+
+        return self
     
     def dfs(self, parents, k, callback, callback_leave=None):
         ''' An utility function to traverse the module. '''

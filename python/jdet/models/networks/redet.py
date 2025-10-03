@@ -4,6 +4,8 @@ from jittor import nn
 from jdet.utils.registry import BOXES, MODELS, build_from_cfg, BACKBONES, HEADS, NECKS, ROI_EXTRACTORS
 from jdet.ops.bbox_transforms import bbox2roi, roi2droi, choose_best_Rroi_batch, dbbox2roi, dbbox2result
 
+from ._training import set_module_training_mode
+
 @MODELS.register_module()
 class ReDet(nn.Module):
     def __init__(self,
@@ -226,8 +228,14 @@ class ReDet(nn.Module):
         else:
             return self.execute_test(images, targets)
     
-    def train(self):
-        super(ReDet, self).train()
+    def train(self, mode: bool = True):
+        try:
+            super(ReDet, self).train(mode)
+        except TypeError:
+            super(ReDet, self).train()
+
         for v in self.__dict__.values():
             if isinstance(v, nn.Module):
-                v.train()
+                set_module_training_mode(v, mode)
+
+        return self

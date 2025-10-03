@@ -1,10 +1,12 @@
-import jittor as jt 
-from jittor import nn 
+import jittor as jt
+from jittor import nn
 from jdet.utils.registry import MODELS,build_from_cfg,BACKBONES,HEADS,NECKS
 import numpy as np
 import jdet
 import copy
 from jdet.models.boxes.box_ops import rotated_box_to_bbox
+
+from ._training import set_module_training_mode
 
 @MODELS.register_module()
 class RetinaNet(nn.Module):
@@ -15,9 +17,19 @@ class RetinaNet(nn.Module):
         self.neck = build_from_cfg(neck,NECKS)
         self.rpn_net = build_from_cfg(rpn_net,HEADS)
 
-    def train(self):
-        super().train()
-        self.backbone.train()
+    def train(self, mode: bool = True):
+        try:
+            super().train(mode)
+        except TypeError:
+            super().train()
+
+        set_module_training_mode(self.backbone, mode)
+        if getattr(self, "neck", None):
+            set_module_training_mode(self.neck, mode)
+        if getattr(self, "rpn_net", None):
+            set_module_training_mode(self.rpn_net, mode)
+
+        return self
 
     def execute(self,images,targets):
         '''
