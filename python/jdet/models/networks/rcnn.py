@@ -1,5 +1,4 @@
 from math import e
-
 import torch
 from torch import nn
 
@@ -55,17 +54,12 @@ class RCNN(nn.Module):
         return self.forward(images, targets)
 
     def train(self, mode: bool = True):
-        try:
-            super().train(mode)
-        except TypeError:
-            super().train()
-
-        set_module_training_mode(self.backbone, mode)
-        if getattr(self, "neck", None):
-            set_module_training_mode(self.neck, mode)
-        if getattr(self, "rpn", None):
-            set_module_training_mode(self.rpn, mode)
-        if getattr(self, "bbox_head", None):
-            set_module_training_mode(self.bbox_head, mode)
-
+        super(RCNN, self).train(mode)
+        self.backbone.train(mode)
+        if self.neck:
+            self.neck.train(mode)
+        if self.rpn:
+            self.rpn.train(mode)
+        if self.bbox_head:
+            self.bbox_head.train(mode)
         return self
