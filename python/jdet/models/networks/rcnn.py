@@ -1,6 +1,6 @@
 from math import e
-import jittor as jt 
-from jittor import nn 
+import torch
+from torch import nn
 
 from jdet.utils.registry import MODELS,build_from_cfg,BACKBONES,HEADS,NECKS
 
@@ -21,10 +21,10 @@ class RCNN(nn.Module):
         self.rpn = build_from_cfg(rpn,HEADS)
         self.bbox_head = build_from_cfg(bbox_head,HEADS)
         
-    def execute(self,images,targets):
+    def forward(self, images, targets):
         '''
         Args:
-            images (jt.Var): image tensors, shape is [N,C,H,W]
+            images (torch.Tensor): image tensors, shape is [N,C,H,W]
             targets (list[dict]): targets for each image
         Rets:
             results: detections
@@ -40,14 +40,24 @@ class RCNN(nn.Module):
 
         output = self.bbox_head(features, proposals_list, targets)
 
-        if self.is_training():
+        if self.training:
             output.update(rpn_losses)
-            
+
         return output
 
-    def train(self):
-        super(RCNN, self).train()
-        self.backbone.train()
-        self.neck.train()
-        self.rpn.train()
-        self.bbox_head.train()
+    # NOTE: retain the execute entry point for backward compatibility with
+    # the original Jittor-based pipeline. ``execute`` simply delegates to
+    # :meth:`forward`, which is the idiomatic PyTorch inference entry point.
+    def execute(self, images, targets):
+        return self.forward(images, targets)
+
+    def train(self, mode: bool = True):
+        super(RCNN, self).train(mode)
+        self.backbone.train(mode)
+        if self.neck:
+            self.neck.train(mode)
+        if self.rpn:
+            self.rpn.train(mode)
+        if self.bbox_head:
+            self.bbox_head.train(mode)
+        return self
