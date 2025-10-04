@@ -1,192 +1,200 @@
-import jittor as jt 
-from jittor import nn 
+from __future__ import annotations
+
+from typing import Optional, Tuple
+
+import torch
+from torch import nn
 
 from jdet.utils.registry import LOSSES
 
 
-from jdet.ops.convex_sort import convex_sort
-from jdet.ops.bbox_transforms import bbox2type, get_bbox_areas
+def _obb_to_poly(boxes: torch.Tensor) -> torch.Tensor:
+    ctr = boxes[..., :2]
+    wh = boxes[..., 2:4]
+    theta = boxes[..., 4]
+    cos, sin = torch.cos(theta), torch.sin(theta)
+
+    dx = wh[..., 0] / 2
+    dy = wh[..., 1] / 2
+
+    corners = torch.stack(
+        [
+            torch.stack([-dx, -dy], dim=-1),
+            torch.stack([dx, -dy], dim=-1),
+            torch.stack([dx, dy], dim=-1),
+            torch.stack([-dx, dy], dim=-1),
+        ],
+        dim=-2,
+    )
+    rot = torch.stack([
+        torch.stack([cos, -sin], dim=-1),
+        torch.stack([sin, cos], dim=-1),
+    ], dim=-2)
+    rotated = torch.matmul(corners, rot)
+    rotated = rotated + ctr.unsqueeze(-2)
+    return rotated.reshape(*boxes.shape[:-1], 8)
 
 
-def shoelace(pts):
-    roll_pts = jt.roll(pts, 1, dims=-2)
-    xyxy = pts[..., 0] * roll_pts[..., 1] - \
-           roll_pts[..., 0] * pts[..., 1]
-    areas = 0.5 * jt.abs(xyxy.sum(dim=-1))
-    return areas
+def bbox2type(bboxes: torch.Tensor, to_type: str) -> torch.Tensor:
+    if to_type == "poly":
+        if bboxes.size(-1) == 5:
+            return _obb_to_poly(bboxes)
+        if bboxes.size(-1) == 8:
+            return bboxes
+        raise ValueError("Unsupported bbox format")
+    raise NotImplementedError
 
 
-def convex_areas(pts, masks):
-    nbs, npts, _ = pts.size()
-    index = convex_sort(pts, masks)
-    index[index == -1] = npts
-    index = index[..., None].repeat(1, 1, 2)
-
-    ext_zeros = jt.zeros((nbs, 1, 2),dtype=pts.dtype)
-    ext_pts = jt.concat([pts, ext_zeros], dim=1)
-    polys = jt.gather(ext_pts, 1, index)
-
-    xyxy_1 = (polys[:, 0:-1, 0] * polys[:, 1:, 1])
-    xyxy_2 = (polys[:, 0:-1, 1] * polys[:, 1:, 0])
-    xyxy_1.sync()
-    xyxy_2.sync()
-
-    xyxy = xyxy_1 - xyxy_2
-    areas = 0.5 * jt.abs(xyxy.sum(dim=-1))
-    return areas
+def get_bbox_areas(bboxes: torch.Tensor) -> torch.Tensor:
+    if bboxes.size(-1) == 5:
+        return bboxes[..., 2] * bboxes[..., 3]
+    polys = bboxes.view(bboxes.size(0), -1, 2)
+    x = polys[..., 0]
+    y = polys[..., 1]
+    area = 0.5 * torch.abs(x * y.roll(-1, dims=-1) - y * x.roll(-1, dims=-1)).sum(dim=-1)
+    return area
 
 
-def poly_intersection(pts1, pts2, areas1=None, areas2=None, eps=1e-6):
-    # Calculate the intersection points and the mask of whether points is inside the lines.
-    # Reference:
-    #    https://en.wikipedia.org/wiki/Line%E2%80%93line_intersection
-    #    https://github.com/lilanxiao/Rotated_IoU/blob/master/box_intersection_2d.py
-    lines1 = jt.concat([pts1, jt.roll(pts1, -1, dims=1)], dim=2)
-    lines2 = jt.concat([pts2, jt.roll(pts2, -1, dims=1)], dim=2)
-    lines1, lines2 = lines1.unsqueeze(2), lines2.unsqueeze(1)
-    x1, y1, x2, y2 = lines1.unbind(dim=-1) # dim: N, 4, 1
-    x3, y3, x4, y4 = lines2.unbind(dim=-1) # dim: N, 1, 4
-
-    num = (x1 - x2) * (y3 - y4) - (y1 - y2) * (x3 - x4)
-    den_t = (x1 - x3) * (y3 - y4) - (y1 - y3) * (x3 - x4)
-    with jt.no_grad():
-        den_u = (x2 - x1) * (y1 - y3) - (y2 - y1) * (x1 - x3)
-        t, u = den_t / num, den_u / num
-        mask_t = (t > 0) & (t < 1)
-        mask_u = (u > 0) & (u < 1)
-        mask_inter = jt.logical_and(mask_t, mask_u)
-
-    t = den_t / (num + eps)
-    x_inter = x1 + t * (x2 - x1)
-    y_inter = y1 + t * (y2 - y1)
-    pts_inter = jt.stack([x_inter, y_inter], dim=-1)
-
-    B = pts1.size(0)
-    pts_inter = pts_inter.view(B, -1, 2)
-    mask_inter = mask_inter.view(B, -1)
-
-    # Judge if one polygon's vertices are inside another polygon.
-    # Use
-    with jt.no_grad():
-        areas1 = shoelace(pts1) if areas1 is None else areas1
-        areas2 = shoelace(pts2) if areas2 is None else areas2
-
-        triangle_areas1 = 0.5 * jt.abs(
-            (x3 - x1) * (y4 - y1) - (y3 - y1) * (x4 - x1))
-        sum_areas1 = triangle_areas1.sum(dim=-1)
-        mask_inside1 = jt.abs(sum_areas1 - areas2[..., None]) < 1e-3 * areas2[..., None]
-
-        triangle_areas2 = 0.5 * jt.abs(
-            (x1 - x3) * (y2 - y3) - (x2 - x3) * (y1 - y3))
-        sum_areas2 = triangle_areas2.sum(dim=-2)
-        mask_inside2 = jt.abs(sum_areas2 - areas1[..., None]) < 1e-3 * areas1[..., None]
-
-    all_pts = jt.concat([pts_inter, pts1, pts2], dim=1)
-    masks = jt.concat([mask_inter, mask_inside1, mask_inside2], dim=1)
-    return all_pts, masks
+def _shoelace(pts: torch.Tensor) -> torch.Tensor:
+    x = pts[..., 0]
+    y = pts[..., 1]
+    return 0.5 * torch.abs((x * y.roll(-1, dims=-1) - y * x.roll(-1, dims=-1)).sum(dim=-1))
 
 
-def poly_enclose(pts1, pts2):
-    all_pts = jt.concat([pts1, pts2], dim=1)
-    mask1 = pts1.new_ones((pts1.size(0), pts1.size(1)))
-    mask2 = pts2.new_ones((pts2.size(0), pts2.size(1)))
-    masks = jt.concat([mask1, mask2], dim=1)
-    return all_pts, masks
+def _convex_hull(points: torch.Tensor) -> torch.Tensor:
+    # points: (N, 2)
+    pts = points.unique(dim=0)
+    if pts.size(0) <= 1:
+        return pts
+    pts = pts[pts[:, 0].argsort()]
+    lower = []
+    for p in pts:
+        while len(lower) >= 2:
+            cross = (lower[-1][0] - lower[-2][0]) * (p[1] - lower[-2][1]) - (lower[-1][1] - lower[-2][1]) * (p[0] - lower[-2][0])
+            if cross <= 0:
+                lower.pop()
+            else:
+                break
+        lower.append(p)
+    upper = []
+    for p in reversed(pts):
+        while len(upper) >= 2:
+            cross = (upper[-1][0] - upper[-2][0]) * (p[1] - upper[-2][1]) - (upper[-1][1] - upper[-2][1]) * (p[0] - upper[-2][0])
+            if cross <= 0:
+                upper.pop()
+            else:
+                break
+        upper.append(p)
+    hull = torch.stack(lower[:-1] + upper[:-1]) if len(lower) + len(upper) > 2 else torch.stack(lower + upper)
+    return hull
 
 
-def poly_iou_loss(pred, target, linear=False, eps=1e-6,weight=None, reduction='mean', avg_factor=None):
-    areas1, areas2 = get_bbox_areas(pred), get_bbox_areas(target)
-    pred, target = bbox2type(pred, 'poly'), bbox2type(target, 'poly')
+def _segment_intersection(p1, p2, q1, q2) -> Tuple[bool, torch.Tensor]:
+    r = p2 - p1
+    s = q2 - q1
+    denom = r[0] * s[1] - r[1] * s[0]
+    if torch.abs(denom) < 1e-7:
+        return False, torch.zeros_like(p1)
+    qp = q1 - p1
+    t = (qp[0] * s[1] - qp[1] * s[0]) / denom
+    u = (qp[0] * r[1] - qp[1] * r[0]) / denom
+    if 0 <= t <= 1 and 0 <= u <= 1:
+        intersection = p1 + t * r
+        return True, intersection
+    return False, torch.zeros_like(p1)
 
-    pred_pts = pred.view(pred.size(0), -1, 2)
-    target_pts = target.view(target.size(0), -1, 2)
-    inter_pts, inter_masks = poly_intersection(
-        pred_pts, target_pts, areas1, areas2, eps)
-    overlap = convex_areas(inter_pts, inter_masks)
 
-    ious = (overlap / (areas1 + areas2 - overlap + eps)).clamp(min_v=eps)
-    if linear:
-        loss = 1 - ious
-    else:
-        loss = -ious.log()
+def _poly_intersection(pts1: torch.Tensor, pts2: torch.Tensor) -> torch.Tensor:
+    intersections = []
+    for i in range(pts1.size(0)):
+        a1 = pts1[i]
+        a2 = pts1[(i + 1) % pts1.size(0)]
+        for j in range(pts2.size(0)):
+            b1 = pts2[j]
+            b2 = pts2[(j + 1) % pts2.size(0)]
+            hit, point = _segment_intersection(a1, a2, b1, b2)
+            if hit:
+                intersections.append(point)
+    # points inside each polygon
+    def inside(poly, pts):
+        if pts.numel() == 0:
+            return torch.empty((0, 2), device=poly.device, dtype=poly.dtype)
+        edges = torch.roll(poly, shifts=-1, dims=0) - poly
+        normals = torch.stack([-edges[:, 1], edges[:, 0]], dim=-1)
+        inside_points = []
+        for p in pts:
+            rel = p - poly
+            cross = (normals * rel).sum(dim=-1)
+            if (cross >= -1e-6).all():
+                inside_points.append(p)
+        if not inside_points:
+            return torch.empty((0, 2), device=poly.device, dtype=poly.dtype)
+        return torch.stack(inside_points)
 
+    pts = []
+    if intersections:
+        pts.append(torch.stack(intersections))
+    inside1 = inside(pts1, pts2)
+    inside2 = inside(pts2, pts1)
+    if inside1.numel() > 0:
+        pts.append(inside1)
+    if inside2.numel() > 0:
+        pts.append(inside2)
+    if not pts:
+        return torch.empty((0, 2), device=pts1.device, dtype=pts1.dtype)
+    all_pts = torch.cat(pts, dim=0)
+    hull = _convex_hull(all_pts)
+    return hull
+
+
+def poly_iou_loss(pred: torch.Tensor, target: torch.Tensor, linear: bool = False, eps: float = 1e-6, weight: Optional[torch.Tensor] = None, reduction: str = "mean", avg_factor: Optional[float] = None) -> torch.Tensor:
+    areas1 = get_bbox_areas(pred)
+    areas2 = get_bbox_areas(target)
+    pred_poly = bbox2type(pred, "poly").view(pred.size(0), -1, 2)
+    target_poly = bbox2type(target, "poly").view(target.size(0), -1, 2)
+
+    overlaps = []
+    for p, t in zip(pred_poly, target_poly):
+        inter = _poly_intersection(p, t)
+        if inter.numel() == 0:
+            overlaps.append(p.new_tensor(0.0))
+        else:
+            overlaps.append(_shoelace(inter.unsqueeze(0))[0])
+    overlap = torch.stack(overlaps)
+
+    ious = (overlap / (areas1 + areas2 - overlap + eps)).clamp(min=eps)
+    loss = 1 - ious if linear else -ious.log()
     if weight is not None:
-        loss *= weight
-    
-    if avg_factor is None:
-        avg_factor = loss.numel()
-    
-    if reduction=="sum":
-        return loss.sum() 
-    elif reduction == "mean":
-        return loss.sum()/avg_factor
-    return loss
-
-
-def poly_giou_loss(pred, target, eps=1e-6, weight=None, reduction='mean', avg_factor=None):
-    areas1, areas2 = get_bbox_areas(pred), get_bbox_areas(target)
-    pred, target = bbox2type(pred, 'poly'), bbox2type(target, 'poly')
-
-    pred_pts = pred.view(pred.size(0), -1, 2)
-    target_pts = target.view(target.size(0), -1, 2)
-    inter_pts, inter_masks = poly_intersection(
-        pred_pts, target_pts, areas1, areas2, eps)
-    overlap = convex_areas(inter_pts, inter_masks)
-
-    union = areas1 + areas2 - overlap + eps
-    ious = (overlap / union).clamp(min=eps)
-
-    enclose_pts, enclose_masks = poly_enclose(pred_pts, target_pts)
-    enclose_areas = convex_areas(enclose_pts, enclose_masks)
-
-    gious = ious - (enclose_areas - union) / enclose_areas
-    loss = 1 - gious
-
-    if weight is not None:
-        loss *= weight
-    
-    if avg_factor is None:
-        avg_factor = loss.numel()
-    
-    if reduction=="sum":
-        return loss.sum() 
-    elif reduction == "mean":
-        return loss.sum()/avg_factor
+        loss = loss * weight
+    if reduction == "mean":
+        if avg_factor is None:
+            avg_factor = max(loss.numel(), 1)
+        loss = loss.sum() / avg_factor
+    elif reduction == "sum":
+        loss = loss.sum()
     return loss
 
 
 @LOSSES.register_module()
 class PolyIoULoss(nn.Module):
-
-    def __init__(self,
-                 linear=False,
-                 eps=1e-6,
-                 reduction='mean',
-                 loss_weight=1.0):
-        super(PolyIoULoss, self).__init__()
+    def __init__(self, linear: bool = False, eps: float = 1e-6, reduction: str = "mean", loss_weight: float = 1.0) -> None:
+        super().__init__()
         self.linear = linear
         self.eps = eps
         self.reduction = reduction
         self.loss_weight = loss_weight
 
-    def execute(self,
-                pred,
-                target,
-                weight=None,
-                avg_factor=None,
-                reduction_override=None,
-                **kwargs):
-        assert reduction_override in (None, 'none', 'mean', 'sum')
-        reduction = (
-            reduction_override if reduction_override else self.reduction)
-
-        if weight is not None and weight.ndim > 1:
-            # TODO: remove this in the future
-            # reduce the weight of shape (n, 4) to (n,) to match the
-            # iou_loss of shape (n,)
-            assert weight.shape == pred.shape
-            weight = weight.mean(-1)
-        loss = self.loss_weight * poly_iou_loss(
+    def forward(
+        self,
+        pred: torch.Tensor,
+        target: torch.Tensor,
+        weight: Optional[torch.Tensor] = None,
+        avg_factor: Optional[float] = None,
+        reduction_override: Optional[str] = None,
+        **kwargs,
+    ) -> torch.Tensor:
+        reduction = reduction_override if reduction_override else self.reduction
+        loss = poly_iou_loss(
             pred,
             target,
             weight=weight,
@@ -194,47 +202,8 @@ class PolyIoULoss(nn.Module):
             eps=self.eps,
             reduction=reduction,
             avg_factor=avg_factor,
-            **kwargs)
-        return loss
+        )
+        return loss * self.loss_weight
 
-
-@LOSSES.register_module()
-class PolyGIoULoss(nn.Module):
-
-    def __init__(self,
-                 eps=1e-6,
-                 reduction='mean',
-                 loss_weight=1.0):
-        super(PolyGIoULoss, self).__init__()
-        self.eps = eps
-        self.reduction = reduction
-        self.loss_weight = loss_weight
-
-    def execute(self,
-                pred,
-                target,
-                weight=None,
-                avg_factor=None,
-                reduction_override=None,
-                **kwargs):
-        assert reduction_override in (None, 'none', 'mean', 'sum')
-        reduction = (
-            reduction_override if reduction_override else self.reduction)
-        if (weight is not None) and (not jt.any(weight > 0)) and (
-                reduction != 'none'):
-            return (pred * weight).sum()  # 0
-        if weight is not None and weight.dim() > 1:
-            # TODO: remove this in the future
-            # reduce the weight of shape (n, 4) to (n,) to match the
-            # iou_loss of shape (n,)
-            assert weight.shape == pred.shape
-            weight = weight.mean(-1)
-        loss = self.loss_weight * poly_giou_loss(
-            pred,
-            target,
-            weight,
-            eps=self.eps,
-            reduction=reduction,
-            avg_factor=avg_factor,
-            **kwargs)
-        return loss
+    def execute(self, *args, **kwargs):  # pragma: no cover
+        return self.forward(*args, **kwargs)
